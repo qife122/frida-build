@@ -1,59 +1,88 @@
 #!/usr/bin/env bash
-# Patch frida source to strip anti-debug detectable signatures.
-# Run from the repo root; expects ./frida (already cloned with submodules).
-# Uses grep to locate strings dynamically — no hardcoded line numbers.
+# Patch frida source to evade the specific anti-debug checks observed on the
+# target (SecNeo hardening on com.qihuo.yinhe):
+#   - /proc/<pid>/net/unix scan for the abstract socket "@/frida-<uuid>"
+#   - /proc/<pid>/task/*/comm scan for frida thread names
+#   - /proc/<pid>/maps / cmdline scan for frida identifiers
 #
-# What it changes (client AND server compiled from the same tree, so endpoint
-# names stay consistent on both sides — that is the whole point of a source
-# build vs a binary patch):
-#   1. thread names  -> defeat /proc/<pid>/task/*/comm scanning
-#   2. re.frida.*    -> D-Bus well-known name + abstract unix socket name,
-#                       defeats /proc/<pid>/net/unix scanning
-#   3. pipe/pool names
-# It deliberately does NOT touch 'frida:rpc' (the wire-protocol magic that the
-# client and server must agree on) or the frida_agent_main exported symbol.
+# DESIGN CHANGE vs the previous (failed) attempt:
+#   * DO NOT touch the D-Bus well-known names (re.frida.HostSession16 etc).
+#     Those are logical interface names, NOT part of the socket path, and
+#     changing them only breaks compatibility with the stock python client.
+#   * DO change the abstract unix socket prefix "/frida-" -> "/axsvc-", which
+#     is what actually shows up in /proc/<pid>/net/unix.
+#   * Keep 'frida:rpc' (wire magic) and frida_agent_main (exported symbol) intact
+#     so the stock client still talks to this server.
+#
+# Run from repo root; expects ./frida (cloned with submodules).
 set -uo pipefail
 cd frida || { echo "ERROR: ./frida not found"; exit 1; }
 
 say(){ echo "=== $* ==="; }
-repl(){ # repl <old> <new> <subtree>
-  local old="$1" new="$2" sub="$3" n=0
-  while IFS= read -r f; do
-    sed -i "s/${old}/${new}/g" "$f" && { echo "  [$sub] $f"; n=$((n+1)); }
-  done < <(grep -rlF "$(printf '%s' "$old" | sed 's/\\\\//g')" "$sub" 2>/dev/null || true)
-  echo "  -> $old : $n files"
-}
 
-say "1) thread names (comm scan: /proc/<pid>/task/*/comm, max 15 chars)"
-# gum-js-loop -> keep <=15 chars, avoid 'frida'/'gum-js' literal
-grep -rl 'gum-js-loop' subprojects/frida-gum 2>/dev/null | while read -r f; do
-  sed -i 's/gum-js-loop/gmain-ui-loop/g' "$f"; echo "  $f"; done || true
-grep -rl '"pool-frida"' subprojects 2>/dev/null | while read -r f; do
-  sed -i 's/"pool-frida"/"pool-worker"/g' "$f"; echo "  $f"; done || true
-grep -rl '"frida-gum"' subprojects/frida-gum 2>/dev/null | while read -r f; do
-  sed -i 's/"frida-gum"/"libgumx-rt"/g' "$f"; echo "  $f"; done || true
+# Equal-semantics textual replacements. Lengths need not match (source build).
+# 1) Abstract socket / pipe prefix — the real /proc/net/unix tell.
+say "1) abstract unix socket prefix  /frida- -> /axsvc-"
+grep -rlF '/frida-' subprojects/frida-core 2>/dev/null | while read -r f; do
+  sed -i 's#/frida-#/axsvc-#g' "$f"; echo "  $f"
+done
 
-say "2) D-Bus / abstract unix socket name (net/unix scan)"
-# re.frida.* appears as the DBus well-known name and the abstract socket.
-# Replacing it everywhere in frida-core keeps client<->server consistent.
-grep -rl 're\.frida' subprojects/frida-core 2>/dev/null | while read -r f; do
-  sed -i 's/re\.frida/re\.axcorp/g' "$f"; echo "  $f"; done || true
+# bare "frida-" used as a pipe/endpoint base in socket.vala / pipe.vala
+say "2) pipe/socket base tokens in base/pipe vala"
+for f in subprojects/frida-core/lib/base/socket.vala \
+         subprojects/frida-core/lib/pipe/pipe.vala; do
+  [ -f "$f" ] || continue
+  # replace a standalone "frida-" string literal (quoted) -> "axsvc-"
+  sed -i 's/"frida-"/"axsvc-"/g; s/"\/frida-"/"\/axsvc-"/g' "$f"
+  echo "  patched $f"
+done
 
-say "3) pipe / injector socket prefixes"
-grep -rl 'frida-pipe' subprojects/frida-core 2>/dev/null | while read -r f; do
-  sed -i 's/frida-pipe/axcorp-pipe/g' "$f"; echo "  $f"; done || true
+# 3) thread names (comm scan, <=15 chars each)
+say "3) thread / loop names (comm scan)"
+declare -A TN=(
+  ["gum-js-loop"]="gum-ui-loop"
+  ["frida-main-loop"]="axsvc-main-lp"
+  ["frida-ctrl"]="axsvc-ctrl"
+  ["frida-context"]="axsvc-context"
+)
+for old in "${!TN[@]}"; do
+  new="${TN[$old]}"
+  grep -rlF "$old" subprojects 2>/dev/null | while read -r f; do
+    sed -i "s/${old}/${new}/g" "$f"; echo "  $old -> $new : $f"
+  done
+done
+# pool-frida / "frida-gum" GLib thread pool & source names
+grep -rlF '"pool-frida"' subprojects 2>/dev/null | while read -r f; do
+  sed -i 's/"pool-frida"/"pool-worker"/g' "$f"; echo "  pool-frida : $f"; done
+grep -rlF 'frida-eternal-agent' subprojects 2>/dev/null | while read -r f; do
+  sed -i 's/frida-eternal-agent/axsvc-eternal-agt/g' "$f"; echo "  eternal-agent : $f"; done
 
-say "VERIFY: frida:rpc must remain (wire protocol)"
-if grep -rq 'frida:rpc' subprojects/frida-core 2>/dev/null; then
-  echo "  OK frida:rpc intact"
+# 4) injected agent library name (visible in target /proc/<pid>/maps)
+# NOTE: left DISABLED by default. Renaming the agent .so touches both the
+# source loader and the meson build/resource packaging; if they fall out of
+# sync the server builds but fails to inject. Enable only if a maps-based
+# 'frida-agent' detection survives the socket/thread patches above.
+# To enable: set PATCH_AGENT=1 in the environment before running.
+if [ "${PATCH_AGENT:-0}" = "1" ]; then
+  say "4) agent .so names (maps scan) [ENABLED]"
+  grep -rlE 'frida-agent' subprojects/frida-core 2>/dev/null | while read -r f; do
+    sed -i 's/frida-agent/axsvc-agent/g' "$f"; echo "  $f"
+  done
 else
-  echo "  NOTE frida:rpc not found under frida-core (may live elsewhere)"
+  say "4) agent .so rename SKIPPED (set PATCH_AGENT=1 to enable)"
 fi
 
-say "VERIFY: residual tells"
-for s in 'gum-js-loop' '"pool-frida"' 're.frida'; do
-  c=$(grep -rl "$s" subprojects 2>/dev/null | wc -l)
-  echo "  '$s' still in $c files (lower is better)"
+# ---- safety: confirm we did NOT break the wire protocol ----
+say "VERIFY: protocol-critical strings must remain"
+for s in 'frida:rpc' 're.frida' 'frida_agent_main'; do
+  c=$(grep -rlF "$s" subprojects 2>/dev/null | wc -l)
+  echo "  '$s' present in $c files (MUST be > 0)"
+done
+
+say "VERIFY: detectable tells should be gone"
+for s in '/frida-' 'gum-js-loop' 'frida-main-loop' 'frida-agent-arm64.so'; do
+  c=$(grep -rlF "$s" subprojects 2>/dev/null | wc -l)
+  echo "  '$s' still in $c files (lower=better)"
 done
 
 say "patch.sh done"
