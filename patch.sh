@@ -1,91 +1,74 @@
 #!/usr/bin/env bash
-# Patch frida source to evade the specific anti-debug checks observed on the
-# target (SecNeo hardening on com.qihuo.yinhe):
-#   - /proc/<pid>/net/unix scan for the abstract socket "@/frida-<uuid>"
-#   - /proc/<pid>/task/*/comm scan for frida thread names
-#   - /proc/<pid>/maps / cmdline scan for frida identifiers
+# Minimal, surgical anti-detection patch for frida (Android arm64, v16).
 #
-# DESIGN CHANGE vs the previous (failed) attempt:
-#   * DO NOT touch the D-Bus well-known names (re.frida.HostSession16 etc).
-#     Those are logical interface names, NOT part of the socket path, and
-#     changing them only breaks compatibility with the stock python client.
-#   * DO change the abstract unix socket prefix "/frida-" -> "/axsvc-", which
-#     is what actually shows up in /proc/<pid>/net/unix.
-#   * Keep 'frida:rpc' (wire magic) and frida_agent_main (exported symbol) intact
-#     so the stock client still talks to this server.
+# HARD LESSON from previous attempts: broad "frida-" rewrites smash build-system
+# identifiers (npm package names like frida-gum / frida-core / @types/frida-gum,
+# produced .so names like frida-agent/frida-helper/frida-gadget, error-quark
+# symbols, and the kernel header linux/frida-syscall.h). Those MUST stay.
 #
-# Run from repo root; expects ./frida (cloned with submodules).
+# Only TWO things are actually scanned by the target's hardening and are safe
+# to change without touching the build graph:
+#   (A) the abstract unix socket path, which in source is the quoted literal
+#       "/frida-..."  (note the LEADING SLASH — package/module names never have
+#       it). Rewriting only "/frida-  ->  "/axsvc-  changes @/frida-<uuid> in
+#       /proc/<pid>/net/unix while leaving every package/.so/symbol name alone.
+#   (B) frida thread names seen in /proc/<pid>/task/*/comm: the gum JS loop
+#       ("gum-js-loop", no "frida-" in it) and the GLib pool name "pool-frida".
+#
+# Everything else (D-Bus names re.frida.*, frida:rpc wire magic, frida-gum/core
+# package names, .so names, quarks, syscall header) is intentionally untouched,
+# which also keeps the STOCK python client fully compatible.
 set -uo pipefail
 cd frida || { echo "ERROR: ./frida not found"; exit 1; }
-
 say(){ echo "=== $* ==="; }
 
-# Equal-semantics textual replacements. Lengths need not match (source build).
-# 1) Abstract socket / pipe prefix — the real /proc/net/unix tell.
-#    CRITICAL: exclude #include lines and any line mentioning 'syscall', so we
-#    never touch  #include <linux/frida-syscall.h>  (frida's own kernel header).
-#    Only genuine string literals like "/frida-%u" get rewritten.
-say "1) abstract unix socket prefix  /frida- -> /axsvc-  (include/syscall-safe)"
-grep -rlF '/frida-' subprojects/frida-core 2>/dev/null | while read -r f; do
-  sed -i '/#include/b; /syscall/b; s#/frida-#/axsvc-#g' "$f"; echo "  $f"
-done
+# (A) abstract unix socket literal:  "/frida-  ->  "/axsvc-
+#     Anchored on  "/frida-  (double-quote + slash) so it can ONLY match a
+#     string literal that starts an absolute-looking socket path. Package names
+#     ("frida-gum"), includes (<linux/frida-syscall.h>) and .so names
+#     ("frida-agent-64.so") never contain the sequence  "/frida- .
+say "(A) socket literal  \"/frida-  ->  \"/axsvc-"
+hitA=0
+while IFS= read -r f; do
+  sed -i 's#"/frida-#"/axsvc-#g' "$f"; echo "  $f"; hitA=$((hitA+1))
+done < <(grep -rlF '"/frida-' subprojects/frida-core 2>/dev/null || true)
+echo "  files touched: $hitA"
 
-# bare "frida-" string literal used as a pipe/endpoint base in socket.vala / pipe.vala
-say "2) pipe/socket base string literals in base/pipe vala"
+# (A2) socket/pipe base literal WITHOUT leading slash, but ONLY inside the two
+#      socket/pipe source files, and ONLY when the literal is "frida-%..." (a
+#      printf-style socket template) or "frida-" immediately closed by a quote.
+#      This cannot hit package names (frida-gum etc.) because those live in
+#      other files and are never written as "frida-%" or a bare "frida-".
+say "(A2) socket/pipe template in socket.vala / pipe.vala only"
 for f in subprojects/frida-core/lib/base/socket.vala \
          subprojects/frida-core/lib/pipe/pipe.vala; do
   [ -f "$f" ] || continue
-  # only quoted literals; include lines never use quotes like this
-  sed -i '/#include/b; /syscall/b; s/"frida-/"axsvc-/g' "$f"
-  echo "  patched $f"
+  sed -i '/#include/b; /syscall/b; s/"frida-%/"axsvc-%/g; s/"frida-"/"axsvc-"/g' "$f"
+  echo "  scanned $f"
 done
 
-# 3) thread names (comm scan, <=15 chars each)
-say "3) thread / loop names (comm scan)"
-declare -A TN=(
-  ["gum-js-loop"]="gum-ui-loop"
-  ["frida-main-loop"]="axsvc-main-lp"
-  ["frida-ctrl"]="axsvc-ctrl"
-  ["frida-context"]="axsvc-context"
-)
-for old in "${!TN[@]}"; do
-  new="${TN[$old]}"
-  grep -rlF "$old" subprojects 2>/dev/null | while read -r f; do
-    sed -i "/#include/b; /syscall/b; s/${old}/${new}/g" "$f"; echo "  $old -> $new : $f"
-  done
-done
-# pool-frida / "frida-gum" GLib thread pool & source names
-grep -rlF '"pool-frida"' subprojects 2>/dev/null | while read -r f; do
-  sed -i '/#include/b; /syscall/b; s/"pool-frida"/"pool-worker"/g' "$f"; echo "  pool-frida : $f"; done
-grep -rlF 'frida-eternal-agent' subprojects 2>/dev/null | while read -r f; do
-  sed -i '/#include/b; /syscall/b; s/frida-eternal-agent/axsvc-eternal-agt/g' "$f"; echo "  eternal-agent : $f"; done
+# (B) thread names (comm scan). Neither contains the substring 'frida-' as a
+#     package/module token, so they are safe standalone literals.
+say "(B) thread names"
+# gum JS run loop -> keep <=15 chars
+while IFS= read -r f; do
+  sed -i 's/gum-js-loop/gum-ui-loop/g' "$f"; echo "  gum-js-loop: $f"
+done < <(grep -rlF 'gum-js-loop' subprojects/frida-gum 2>/dev/null || true)
+# GLib thread-pool name (quoted literal)
+while IFS= read -r f; do
+  sed -i 's/"pool-frida"/"pool-worker"/g' "$f"; echo "  pool-frida: $f"
+done < <(grep -rlF '"pool-frida"' subprojects 2>/dev/null || true)
 
-# 4) injected agent library name (visible in target /proc/<pid>/maps)
-# NOTE: left DISABLED by default. Renaming the agent .so touches both the
-# source loader and the meson build/resource packaging; if they fall out of
-# sync the server builds but fails to inject. Enable only if a maps-based
-# 'frida-agent' detection survives the socket/thread patches above.
-# To enable: set PATCH_AGENT=1 in the environment before running.
-if [ "${PATCH_AGENT:-0}" = "1" ]; then
-  say "4) agent .so names (maps scan) [ENABLED]"
-  grep -rlE 'frida-agent' subprojects/frida-core 2>/dev/null | while read -r f; do
-    sed -i 's/frida-agent/axsvc-agent/g' "$f"; echo "  $f"
-  done
-else
-  say "4) agent .so rename SKIPPED (set PATCH_AGENT=1 to enable)"
-fi
-
-# ---- safety: confirm we did NOT break the wire protocol ----
-say "VERIFY: protocol-critical strings must remain"
-for s in 'frida:rpc' 're.frida' 'frida_agent_main'; do
+# ---- verification ----
+say "VERIFY must-remain (build + wire protocol + stock-client compat)"
+for s in 'frida:rpc' 're.frida' 'frida-gum' 'frida-core' 'frida-agent' 'linux/frida-syscall.h'; do
   c=$(grep -rlF "$s" subprojects 2>/dev/null | wc -l)
-  echo "  '$s' present in $c files (MUST be > 0)"
+  echo "  '$s' in $c files (MUST be > 0)"
 done
 
-say "VERIFY: detectable tells should be gone"
-for s in '/frida-' 'gum-js-loop' 'frida-main-loop' 'frida-agent-arm64.so'; do
-  c=$(grep -rlF "$s" subprojects 2>/dev/null | wc -l)
-  echo "  '$s' still in $c files (lower=better)"
-done
+say "VERIFY socket/thread tells rewritten"
+echo "  '\"/frida-' remaining : $(grep -rlF '"/frida-' subprojects/frida-core 2>/dev/null | wc -l)  (want 0)"
+echo "  '\"/axsvc-' present   : $(grep -rlF '"/axsvc-' subprojects/frida-core 2>/dev/null | wc -l)  (want >0)"
+echo "  'gum-js-loop' remain : $(grep -rlF 'gum-js-loop' subprojects 2>/dev/null | wc -l)  (want 0)"
 
 say "patch.sh done"
