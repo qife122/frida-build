@@ -22,18 +22,21 @@ say(){ echo "=== $* ==="; }
 
 # Equal-semantics textual replacements. Lengths need not match (source build).
 # 1) Abstract socket / pipe prefix — the real /proc/net/unix tell.
-say "1) abstract unix socket prefix  /frida- -> /axsvc-"
+#    CRITICAL: exclude #include lines and any line mentioning 'syscall', so we
+#    never touch  #include <linux/frida-syscall.h>  (frida's own kernel header).
+#    Only genuine string literals like "/frida-%u" get rewritten.
+say "1) abstract unix socket prefix  /frida- -> /axsvc-  (include/syscall-safe)"
 grep -rlF '/frida-' subprojects/frida-core 2>/dev/null | while read -r f; do
-  sed -i 's#/frida-#/axsvc-#g' "$f"; echo "  $f"
+  sed -i '/#include/b; /syscall/b; s#/frida-#/axsvc-#g' "$f"; echo "  $f"
 done
 
-# bare "frida-" used as a pipe/endpoint base in socket.vala / pipe.vala
-say "2) pipe/socket base tokens in base/pipe vala"
+# bare "frida-" string literal used as a pipe/endpoint base in socket.vala / pipe.vala
+say "2) pipe/socket base string literals in base/pipe vala"
 for f in subprojects/frida-core/lib/base/socket.vala \
          subprojects/frida-core/lib/pipe/pipe.vala; do
   [ -f "$f" ] || continue
-  # replace a standalone "frida-" string literal (quoted) -> "axsvc-"
-  sed -i 's/"frida-"/"axsvc-"/g; s/"\/frida-"/"\/axsvc-"/g' "$f"
+  # only quoted literals; include lines never use quotes like this
+  sed -i '/#include/b; /syscall/b; s/"frida-/"axsvc-/g' "$f"
   echo "  patched $f"
 done
 
@@ -48,14 +51,14 @@ declare -A TN=(
 for old in "${!TN[@]}"; do
   new="${TN[$old]}"
   grep -rlF "$old" subprojects 2>/dev/null | while read -r f; do
-    sed -i "s/${old}/${new}/g" "$f"; echo "  $old -> $new : $f"
+    sed -i "/#include/b; /syscall/b; s/${old}/${new}/g" "$f"; echo "  $old -> $new : $f"
   done
 done
 # pool-frida / "frida-gum" GLib thread pool & source names
 grep -rlF '"pool-frida"' subprojects 2>/dev/null | while read -r f; do
-  sed -i 's/"pool-frida"/"pool-worker"/g' "$f"; echo "  pool-frida : $f"; done
+  sed -i '/#include/b; /syscall/b; s/"pool-frida"/"pool-worker"/g' "$f"; echo "  pool-frida : $f"; done
 grep -rlF 'frida-eternal-agent' subprojects 2>/dev/null | while read -r f; do
-  sed -i 's/frida-eternal-agent/axsvc-eternal-agt/g' "$f"; echo "  eternal-agent : $f"; done
+  sed -i '/#include/b; /syscall/b; s/frida-eternal-agent/axsvc-eternal-agt/g' "$f"; echo "  eternal-agent : $f"; done
 
 # 4) injected agent library name (visible in target /proc/<pid>/maps)
 # NOTE: left DISABLED by default. Renaming the agent .so touches both the
